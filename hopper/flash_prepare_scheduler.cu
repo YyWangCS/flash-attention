@@ -15,6 +15,11 @@
 
 namespace flash {
 
+// Provide CUDART_INF_F if not available from CUDA headers
+#ifndef CUDART_INF_F
+#define CUDART_INF_F __int_as_float(0x7f800000)
+#endif
+
 // Sort in descending order
 template <typename T>
 struct PrepareSortOp
@@ -65,6 +70,26 @@ __global__ void prepare_varlen_num_blocks_kernel(
     using BlockMergeSort = cub::BlockMergeSort<int4, BLOCK_DIM_X, ITEMS_PER_THREAD>;
 
     __shared__ int total_blocks_smem[kSmemSize];
+
+    // Shared buffers for SM allocation refinement and top-K selection
+    __shared__ int sm_lower_sum_smem;
+    __shared__ float ratio_scores[BLOCK_DIM_X];
+    __shared__ int select_flags[BLOCK_DIM_X];
+    __shared__ int available_sms_smem;
+    struct ScoreIdx { float s; unsigned int i; };
+    struct MaxByScore {
+        __device__ __forceinline__ ScoreIdx operator()(ScoreIdx a, ScoreIdx b) const {
+            return (a.s > b.s) ? a : b;
+        }
+    };
+    __shared__ typename cub::BlockReduce<ScoreIdx, BLOCK_DIM_X>::TempStorage reduce_smem;
+    using ScoreSort = cub::BlockMergeSort<ScoreIdx, BLOCK_DIM_X, ITEMS_PER_THREAD>;
+    struct ScoreIdxDesc {
+        __device__ __forceinline__ bool operator()(ScoreIdx const & lhs, ScoreIdx const & rhs) const {
+            return lhs.s > rhs.s; // descending by score
+        }
+    };
+    __shared__ typename ScoreSort::TempStorage score_sort_storage;
 
     // Allocate shared memory for BlockMergeSort operations
     __shared__ typename BlockMergeSort::TempStorage temp_storage;
@@ -152,10 +177,62 @@ __global__ void prepare_varlen_num_blocks_kernel(
         if (lane == 0) { atomicAdd(total_blocks_smem, total_blocks); }
         __syncthreads();
         total_blocks = total_blocks_smem[0];
-        // 10% margin
-        int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
-        // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
-        num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
+        float blocks_per_sm = float(total_blocks) * float(num_head) / float(num_sm);
+        float num_sm_per_request = std::max(float(num_n_blocks) / blocks_per_sm, 1.0f);
+        int num_sm_lower_bound = int(num_sm_per_request);
+
+        // step1: block-wide reduction of num_sm_lower_bound across valid threads
+        if (threadIdx.x == 0) { sm_lower_sum_smem = 0; }
+        __syncthreads();
+        int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
+        int lower_bound_contrib = valid_thread ? num_sm_lower_bound : 0;
+        // warp reduce
+        #pragma unroll
+        for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
+            lower_bound_contrib += __shfl_down_sync(0xffffffff, lower_bound_contrib, i);
+        }
+        if (lane == 0) { atomicAdd(&sm_lower_sum_smem, lower_bound_contrib); }
+        __syncthreads();
+
+        // step2: if there are available SMs, select top-K by ratio and increment those requests' lower bounds
+        if (threadIdx.x == 0) {
+            int total_lower = sm_lower_sum_smem;
+            available_sms_smem = max(num_sm - total_lower, 0);
+        }
+        __syncthreads();
+
+        // Prepare scores and flags for selection
+        float score = -CUDART_INF_F;
+        if (valid_thread && num_sm_lower_bound > 0) {
+            // Prefer requests where x/floor(x) is highest; approximate via fixed ratio
+            score = num_sm_per_request / float(num_sm_lower_bound);
+        }
+        ratio_scores[threadIdx.x] = score;
+        select_flags[threadIdx.x] = 0;
+        __syncthreads();
+
+        int K = available_sms_smem;
+        if (K > 0) {
+            K = min(K, BLOCK_DIM_X);
+            // Build sortable items (score, original index), one per thread
+            ScoreIdx items[ITEMS_PER_THREAD];
+            items[0] = { ratio_scores[threadIdx.x], threadIdx.x };
+            // Sort all items in descending order of score across the block
+            ScoreSort(score_sort_storage).Sort(items, ScoreIdxDesc());
+            __syncthreads();
+            // Threads 0..K-1 mark winners by original index
+            if (threadIdx.x < K && items[0].s != -CUDART_INF_F) {
+                select_flags[items[0].i] = 1;
+            }
+            __syncthreads();
+        }
+
+        if (valid_thread && select_flags[threadIdx.x]) {
+            num_sm_lower_bound += 1;
+        }
+
+        // Final dynamic split count per request is the adjusted lower bound, clamped by user cap
+        num_splits_dynamic = max(min(num_sm_lower_bound, num_splits_static), 1);
         // num_n_blocks per work tile for the batch
         num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
     }
