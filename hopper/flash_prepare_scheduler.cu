@@ -74,21 +74,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
     // Shared buffers for SM allocation refinement and top-K selection
     __shared__ int total_splits_smem;
     __shared__ int select_flags[BLOCK_DIM_X];
-    __shared__ int available_sms_smem;
-    struct ScoreIdx { float s; unsigned int i; };
-    struct MaxByScore {
-        __device__ __forceinline__ ScoreIdx operator()(ScoreIdx a, ScoreIdx b) const {
-            return (a.s > b.s) ? a : b;
-        }
-    };
 
     __shared__ typename cub::BlockReduce<int, BLOCK_DIM_X>::TempStorage splits_reduce_smem;
-    using ScoreSort = cub::BlockMergeSort<ScoreIdx, BLOCK_DIM_X, ITEMS_PER_THREAD>;
-    struct ScoreIdxDesc {
-        __device__ __forceinline__ bool operator()(ScoreIdx const & lhs, ScoreIdx const & rhs) const {
-            return lhs.s > rhs.s; // descending by score
-        }
-    };
     
     // Structure for sorting by num_n_blocks_per_split (ascending order)
     struct BlocksPerSplitIdx { int blocks_per_split; unsigned int thread_idx; };
@@ -97,8 +84,23 @@ __global__ void prepare_varlen_num_blocks_kernel(
             return lhs.blocks_per_split < rhs.blocks_per_split; // ascending by blocks_per_split
         }
     };
+
     using BlocksPerSplitSort = cub::BlockMergeSort<BlocksPerSplitIdx, BLOCK_DIM_X, ITEMS_PER_THREAD>;
     __shared__ typename BlocksPerSplitSort::TempStorage blocks_per_split_sort_storage;
+    
+    // Structure for sorting (original_num_blocks, original_blocks_per_split) pairs
+    struct OriginalPair { int num_blocks; int splits; };
+    struct OriginalPairDesc {
+        __device__ __forceinline__ bool operator()(OriginalPair const & lhs, OriginalPair const & rhs) const {
+            return lhs.num_blocks > rhs.num_blocks; // descending by num_blocks
+        }
+    };
+    using OriginalPairSort = cub::BlockMergeSort<OriginalPair, BLOCK_DIM_X, ITEMS_PER_THREAD>;
+    __shared__ typename OriginalPairSort::TempStorage original_pair_sort_storage;
+    
+    // BlockScan for finding cumulative positions
+    __shared__ typename cub::BlockScan<int, BLOCK_DIM_X>::TempStorage scan_storage;
+    
 
     // Allocate shared memory for BlockMergeSort operations
     __shared__ typename BlockMergeSort::TempStorage temp_storage;
@@ -189,12 +191,19 @@ __global__ void prepare_varlen_num_blocks_kernel(
         int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
         num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
 
-        // Calculate total splits across all valid threads
+        // Calculate original scheme values for comparison
         int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
+        
+        // Original scheme: calculate num_n_blocks_original and num_n_blocks_per_split_original
+        int num_n_blocks_original = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); // Original blocks per thread after splitting
+        int num_n_blocks_per_split_original = num_splits_dynamic; // Original splits per thread
+        int num_n_blocks_total_original = num_n_blocks; // Original total blocks before splitting
+        
+        // Calculate total splits for original scheme
         int splits_contrib = valid_thread ? num_splits_dynamic : 0;
         
         // Block reduction to get total splits
-        int total_splits = cub::BlockReduce<int>(splits_reduce_smem).Sum(splits_contrib);
+        int total_splits = cub::BlockReduce<int, BLOCK_DIM_X>(splits_reduce_smem).Sum(splits_contrib);
         __syncthreads();
         
         if (threadIdx.x == 0) {
@@ -239,7 +248,79 @@ __global__ void prepare_varlen_num_blocks_kernel(
         }
         
         // Final calculation of num_n_blocks per work tile
-        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
+        
+        // Compare original scheme vs new scheme using Scan approach
+        if (total_splits > num_sm) {
+            // Step 1: Sort (original_num_blocks, original_blocks_per_split) pairs by num_blocks descending
+            OriginalPair pairs[ITEMS_PER_THREAD];
+            if (valid_thread) {
+                pairs[0] = { num_n_blocks_original, num_n_blocks_per_split_original };
+            } else {
+                pairs[0] = { 0, 0 };
+            }
+            
+            OriginalPairSort(original_pair_sort_storage).Sort(pairs, OriginalPairDesc());
+            __syncthreads();
+            
+            // Step 2: Perform scan on splits to find cumulative positions
+            int splits_value = pairs[0].splits;
+            int cumulative_splits;
+            cub::BlockScan<int, BLOCK_DIM_X>(scan_storage).ExclusiveSum(splits_value, cumulative_splits);
+            __syncthreads();
+            
+            // Step 3: Find threads containing positions num_sm-1 and num_sm
+            int wave_sum = 0;
+            if (valid_thread && pairs[0].num_blocks > 0) {
+                // Check if this thread's range contains position num_sm-1
+                if (cumulative_splits <= num_sm - 1 && cumulative_splits + splits_value > num_sm - 1) {
+                    wave_sum += pairs[0].num_blocks;
+                }
+                // Check if this thread's range contains position num_sm
+                if (cumulative_splits <= num_sm && cumulative_splits + splits_value > num_sm) {
+                    wave_sum += pairs[0].num_blocks;
+                }
+            }
+            
+            // Step 4: Sum up the wave_sum across all threads
+            int original_wave_sum = cub::BlockReduce<int, BLOCK_DIM_X>(splits_reduce_smem).Sum(wave_sum);
+            __syncthreads();
+            
+            if (threadIdx.x == 0) {
+                total_splits_smem = original_wave_sum;
+            }
+            __syncthreads();
+            
+            original_wave_sum = total_splits_smem;
+            
+            // Step 5: Calculate new scheme's max
+            int new_max_blocks = 0;
+            if (valid_thread) {
+                int reduced_splits = max(num_splits_dynamic - 1, 1);
+                new_max_blocks = cutlass::ceil_div(num_n_blocks_total_original, reduced_splits);
+            }
+            
+            int new_max_total = cub::BlockReduce<int, BLOCK_DIM_X>(splits_reduce_smem).Reduce(new_max_blocks, cub::Max());
+            __syncthreads();
+            
+            if (threadIdx.x == 0) {
+                total_splits_smem = new_max_total;
+            }
+            __syncthreads();
+            
+            new_max_total = total_splits_smem;
+            
+            // Step 6: Choose the better scheme
+            if (new_max_total < original_wave_sum) {
+                // Use new scheme (already applied above)
+            } else {
+                // Use original scheme - revert to original splits
+                if (valid_thread) {
+                    num_splits_dynamic = num_n_blocks_per_split_original;
+                    num_n_blocks = num_n_blocks_original;
+                }
+            }
+        } 
     }
 
     if constexpr (Sort) {
