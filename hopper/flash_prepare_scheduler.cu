@@ -296,7 +296,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
             // Step 5: Calculate new scheme's max
             int new_max_blocks = 0;
             if (valid_thread) {
-                int reduced_splits = max(num_splits_dynamic - 1, 1);
+                int reduced_splits = max(num_splits_dynamic, 1);
                 new_max_blocks = cutlass::ceil_div(num_n_blocks_total_original, reduced_splits);
             }
             
