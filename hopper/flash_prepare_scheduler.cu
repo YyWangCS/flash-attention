@@ -72,8 +72,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
     __shared__ int total_blocks_smem[kSmemSize];
 
     // Shared buffers for SM allocation refinement and top-K selection
-    __shared__ int sm_lower_sum_smem;
-    __shared__ float ratio_scores[BLOCK_DIM_X];
+    __shared__ int total_splits_smem;
     __shared__ int select_flags[BLOCK_DIM_X];
     __shared__ int available_sms_smem;
     struct ScoreIdx { float s; unsigned int i; };
@@ -82,14 +81,24 @@ __global__ void prepare_varlen_num_blocks_kernel(
             return (a.s > b.s) ? a : b;
         }
     };
-    __shared__ typename cub::BlockReduce<ScoreIdx, BLOCK_DIM_X>::TempStorage reduce_smem;
+
+    __shared__ typename cub::BlockReduce<int, BLOCK_DIM_X>::TempStorage splits_reduce_smem;
     using ScoreSort = cub::BlockMergeSort<ScoreIdx, BLOCK_DIM_X, ITEMS_PER_THREAD>;
     struct ScoreIdxDesc {
         __device__ __forceinline__ bool operator()(ScoreIdx const & lhs, ScoreIdx const & rhs) const {
             return lhs.s > rhs.s; // descending by score
         }
     };
-    __shared__ typename ScoreSort::TempStorage score_sort_storage;
+    
+    // Structure for sorting by num_n_blocks_per_split (ascending order)
+    struct BlocksPerSplitIdx { int blocks_per_split; unsigned int thread_idx; };
+    struct BlocksPerSplitAsc {
+        __device__ __forceinline__ bool operator()(BlocksPerSplitIdx const & lhs, BlocksPerSplitIdx const & rhs) const {
+            return lhs.blocks_per_split < rhs.blocks_per_split; // ascending by blocks_per_split
+        }
+    };
+    using BlocksPerSplitSort = cub::BlockMergeSort<BlocksPerSplitIdx, BLOCK_DIM_X, ITEMS_PER_THREAD>;
+    __shared__ typename BlocksPerSplitSort::TempStorage blocks_per_split_sort_storage;
 
     // Allocate shared memory for BlockMergeSort operations
     __shared__ typename BlockMergeSort::TempStorage temp_storage;
@@ -177,63 +186,59 @@ __global__ void prepare_varlen_num_blocks_kernel(
         if (lane == 0) { atomicAdd(total_blocks_smem, total_blocks); }
         __syncthreads();
         total_blocks = total_blocks_smem[0];
-        float blocks_per_sm = float(total_blocks) * float(num_head) / float(num_sm);
-        float num_sm_per_request = std::max(float(num_n_blocks) / blocks_per_sm, 1.0f);
-        int num_sm_lower_bound = int(num_sm_per_request);
+        int blocks_per_sm = static_cast<int>(ceilf(float(total_blocks) * 1.1f * float(num_head) / float(num_sm)));
+        num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
 
-        // step1: block-wide reduction of num_sm_lower_bound across valid threads
-        if (threadIdx.x == 0) { sm_lower_sum_smem = 0; }
-        __syncthreads();
+        // Calculate total splits across all valid threads
         int valid_thread = (lane < kNumBatchPerWarp && batch_idx < num_batch) ? 1 : 0;
-        int lower_bound_contrib = valid_thread ? num_sm_lower_bound : 0;
-        // warp reduce
-        #pragma unroll
-        for (int i = cutlass::NumThreadsPerWarp / 2; i >= 1; i /= 2) {
-            lower_bound_contrib += __shfl_down_sync(0xffffffff, lower_bound_contrib, i);
-        }
-        if (lane == 0) { atomicAdd(&sm_lower_sum_smem, lower_bound_contrib); }
+        int splits_contrib = valid_thread ? num_splits_dynamic : 0;
+        
+        // Block reduction to get total splits
+        int total_splits = cub::BlockReduce<int>(splits_reduce_smem).Sum(splits_contrib);
         __syncthreads();
-
-        // step2: if there are available SMs, select top-K by ratio and increment those requests' lower bounds
+        
         if (threadIdx.x == 0) {
-            int total_lower = sm_lower_sum_smem;
-            available_sms_smem = max(num_sm - total_lower, 0);
+            total_splits_smem = total_splits;
         }
         __syncthreads();
-
-        // Prepare scores and flags for selection
-        float score = -CUDART_INF_F;
-        if (valid_thread && num_sm_lower_bound > 0) {
-            // Prefer requests where x/floor(x) is highest; approximate via fixed ratio
-            score = num_sm_per_request / float(num_sm_lower_bound);
-        }
-        ratio_scores[threadIdx.x] = score;
-        select_flags[threadIdx.x] = 0;
-        __syncthreads();
-
-        int K = available_sms_smem;
-        if (K > 0) {
-            K = min(K, BLOCK_DIM_X);
-            // Build sortable items (score, original index), one per thread
-            ScoreIdx items[ITEMS_PER_THREAD];
-            items[0] = { ratio_scores[threadIdx.x], threadIdx.x };
-            // Sort all items in descending order of score across the block
-            ScoreSort(score_sort_storage).Sort(items, ScoreIdxDesc());
+        
+        total_splits = total_splits_smem;
+        
+        // If total splits exceed available SMs, we need to reduce some threads' splits
+        if (total_splits > num_sm) {
+            int topk = total_splits - num_sm;
+            topk = min(topk, BLOCK_DIM_X);
+            
+            // Calculate num_n_blocks_per_split for each thread if we reduce its splits by 1
+            int num_splits_dynamic_lower = max(num_splits_dynamic - 1, 1);
+            int num_n_blocks_per_split = cutlass::ceil_div(num_n_blocks, num_splits_dynamic_lower);
+            
+            // Prepare items for sorting (only for valid threads)
+            BlocksPerSplitIdx items[ITEMS_PER_THREAD];
+            if (valid_thread && num_splits_dynamic > 1) {
+                items[0] = { num_n_blocks_per_split, threadIdx.x };
+            } else {
+                items[0] = { INT_MAX, threadIdx.x }; // Invalid threads get max value
+            }
+            
+            // Sort by num_n_blocks_per_split in ascending order
+            BlocksPerSplitSort(blocks_per_split_sort_storage).Sort(items, BlocksPerSplitAsc());
             __syncthreads();
-            // Threads 0..K-1 mark winners by original index
-            if (threadIdx.x < K && items[0].s != -CUDART_INF_F) {
-                select_flags[items[0].i] = 1;
+            
+            // Mark threads that should reduce their splits (topk smallest impact)
+            select_flags[threadIdx.x] = 0;
+            if (threadIdx.x < topk && items[0].blocks_per_split != INT_MAX) {
+                select_flags[items[0].thread_idx] = 1;
             }
             __syncthreads();
+            
+            // Apply reduction to selected threads
+            if (valid_thread && select_flags[threadIdx.x]) {
+                num_splits_dynamic = max(num_splits_dynamic - 1, 1);
+            }
         }
-
-        if (valid_thread && select_flags[threadIdx.x]) {
-            num_sm_lower_bound += 1;
-        }
-
-        // Final dynamic split count per request is the adjusted lower bound, clamped by user cap
-        num_splits_dynamic = max(min(num_sm_lower_bound, num_splits_static), 1);
-        // num_n_blocks per work tile for the batch
+        
+        // Final calculation of num_n_blocks per work tile
         num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
     }
 
